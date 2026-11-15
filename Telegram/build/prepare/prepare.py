@@ -2173,6 +2173,13 @@ mac:
     mv $USED_PREFIX/include/wallet_engine/wallet_engine.cpp $USED_PREFIX/src/wallet_engine/wallet_engine.cpp
 """)
 
+# Phantom: the Windows client is built with DESKTOP_APP_DISABLE_CRASH_REPORTS=ON,
+# so breakpad is never linked. Its sources need ATL headers that some VS images
+# miss, so allow skipping it entirely.
+if os.environ.get('PHANTOM_NO_CRASH_REPORTS') == '1':
+    stages = [s for s in stages
+              if s['name'] not in ('breakpad', 'crashpad', 'stackwalk')]
+
 if win:
     currentCodePage = subprocess.run('chcp', capture_output=True, shell=True, text=True, env=modifiedEnv).stdout.strip().split()[-1]
     subprocess.run('chcp 65001 > nul', shell=True, env=modifiedEnv)

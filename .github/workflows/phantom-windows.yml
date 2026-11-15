@@ -10,6 +10,9 @@ jobs:
     env:
       UPLOAD_ARTIFACT: "true"
       TBUILD: ${{ github.workspace }}\TBuild
+      # Client is built with DESKTOP_APP_DISABLE_CRASH_REPORTS=ON, so breakpad
+      # is unused; skipping it also avoids the missing ATL headers on the image.
+      PHANTOM_NO_CRASH_REPORTS: "1"
     defaults:
       run:
         shell: cmd
