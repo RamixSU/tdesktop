@@ -1784,10 +1784,10 @@ win:
     )
     cd ..
 
-    SET CONFIGURATIONS=-debug
+    rem Phantom: only Release Qt. The client is built Release only, so the
+    rem Debug copy of static Qt would just waste ~6 GB and ~25 minutes.
+    SET CONFIGURATIONS=-release
     SET ASSERTS=
-release:
-    SET CONFIGURATIONS=-debug-and-release
 win_asserts:
     SET ASSERTS=-force-asserts
 win:

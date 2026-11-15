@@ -1,15 +1,3 @@
-# Builds the phantom-economy Telegram Desktop for Windows x64 (Release) on
-# GitHub Actions and uploads a portable zip with the launcher.
-#
-# How to use:
-#   1. Fork https://github.com/telegramdesktop/tdesktop (or push this tree).
-#   2. Copy phantom_economy.patch to the repository root.
-#   3. Copy this file to .github/workflows/phantom-windows.yml.
-#   4. Actions -> "Phantom Windows Release" -> Run workflow.
-#   5. Download the Phantom-Telegram-Windows-x64 artifact.
-#
-# The job mirrors the stock win.yml pipeline: prepare all libraries, configure
-# with Release, build, then pack out\Release together with launcher\*.
 name: Phantom Windows Release
 
 on:
@@ -31,6 +19,47 @@ jobs:
           mkdir %userprofile%\TBuild\Libraries
           mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
           echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+
+      # windows-latest has ~14 GB free, which is not enough for static Qt +
+      # TDLib + a Release build. Remove preinstalled SDKs the build never uses.
+      - name: Free up disk space
+        shell: pwsh
+        run: |
+          function Show-Free {
+            Get-PSDrive C | ForEach-Object {
+              "Free on C: {0:N1} GB" -f ($_.Free / 1GB)
+            }
+          }
+          Show-Free
+          $targets = @(
+            'C:\Program Files\Android',
+            'C:\Program Files (x86)\Android',
+            'C:\Program Files\dotnet',
+            'C:\Program Files\Microsoft SDKs\Azure',
+            'C:\ProgramData\Microsoft\VisualStudio\Packages',
+            'C:\Program Files (x86)\Microsoft Visual Studio\Installer\DownloadCache',
+            'C:\hostedtoolcache\windows\Java_Adoptium',
+            'C:\hostedtoolcache\windows\Ruby',
+            'C:\hostedtoolcache\windows\go',
+            'C:\hostedtoolcache\windows\node',
+            'C:\hostedtoolcache\windows\PyPy',
+            'C:\Program Files\Azure Data Studio',
+            'C:\Program Files\Microsoft SQL Server',
+            'C:\Program Files\PostgreSQL',
+            'C:\Program Files\Google\Chrome',
+            'C:\Program Files (x86)\Google\Chrome',
+            'C:\Program Files\Microsoft\Edge',
+            'C:\Program Files (x86)\Microsoft\Edge',
+            'C:\Program Files\Mozilla Firefox'
+          )
+          foreach ($t in $targets) {
+            if (Test-Path $t) {
+              Remove-Item $t -Recurse -Force -ErrorAction SilentlyContinue
+              Write-Host "removed $t"
+            }
+          }
+          Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Show-Free
 
       - name: Get repository name
         shell: bash
@@ -59,15 +88,8 @@ jobs:
           key: ${{ runner.os }}-phantom-third-party-v1
           restore-keys: ${{ runner.os }}-phantom-third-party-
 
-      - name: Libraries cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ env.TBUILD }}\Libraries\win64\*
-            !${{ env.TBUILD }}\Libraries\win64\cache_keys
-          key: ${{ runner.os }}-phantom-libs-v1
-          restore-keys: ${{ runner.os }}-phantom-libs-
-
+      # The Libraries tree is far over the 10 GB cache limit, so it is not
+      # cached here; the workflow relies on the runner's own disk instead.
       - name: Apply phantom patch
         shell: bash
         run: |
@@ -78,9 +100,24 @@ jobs:
             git apply --whitespace=nowarn phantom_economy.patch
           fi
 
+      # No skip-release: the client is Release, so Release libraries are
+      # mandatory. Qt itself is patched to build Release only, see prepare.py.
       - name: Libraries
         run: |
-          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat skip-release silent
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat silent
+
+      - name: Show disk usage
+        shell: pwsh
+        run: |
+          Get-PSDrive C | ForEach-Object {
+            "Free on C: {0:N1} GB" -f ($_.Free / 1GB)
+          }
+
+      # Drop sources/object files of every dependency, keep headers and libs.
+      - name: Prune libraries
+        shell: bash
+        run: |
+          find "$LibrariesPath" '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/nv-codec-headers/*' ')' -type f ')' -o -empty ')' -delete
 
       - name: Configure
         run: |
@@ -111,6 +148,8 @@ jobs:
           Copy-Item (Join-Path $root 'launcher\*') $dist -Force -ErrorAction SilentlyContinue
           $zip = Join-Path $env:TBUILD 'Phantom-Telegram-Windows-x64.zip'
           Compress-Archive -Path (Join-Path $dist '*') -DestinationPath $zip -Force
+          $size = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+          Write-Host "Archive: $zip ($size MB)"
           "ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Upload artifact
