@@ -20,8 +20,10 @@ jobs:
           mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
           echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
 
-      # windows-latest has ~14 GB free, which is not enough for static Qt +
+      # windows-latest has ~28 GB free, which is not enough for static Qt +
       # TDLib + a Release build. Remove preinstalled SDKs the build never uses.
+      # NOTE: C:\ProgramData\Microsoft\VisualStudio\Packages\_Instances must
+      # survive, otherwise vswhere stops finding Visual Studio.
       - name: Free up disk space
         shell: pwsh
         run: |
@@ -30,13 +32,18 @@ jobs:
               "Free on C: {0:N1} GB" -f ($_.Free / 1GB)
             }
           }
+          function Remove-Fast($path) {
+            if (Test-Path $path) {
+              cmd /c "rd /s /q `"$path`"" 2>$null
+              Write-Host "removed $path"
+            }
+          }
           Show-Free
           $targets = @(
             'C:\Program Files\Android',
             'C:\Program Files (x86)\Android',
             'C:\Program Files\dotnet',
             'C:\Program Files\Microsoft SDKs\Azure',
-            'C:\ProgramData\Microsoft\VisualStudio\Packages',
             'C:\Program Files (x86)\Microsoft Visual Studio\Installer\DownloadCache',
             'C:\hostedtoolcache\windows\Java_Adoptium',
             'C:\hostedtoolcache\windows\Ruby',
@@ -52,14 +59,27 @@ jobs:
             'C:\Program Files (x86)\Microsoft\Edge',
             'C:\Program Files\Mozilla Firefox'
           )
-          foreach ($t in $targets) {
-            if (Test-Path $t) {
-              Remove-Item $t -Recurse -Force -ErrorAction SilentlyContinue
-              Write-Host "removed $t"
-            }
+          foreach ($t in $targets) { Remove-Fast $t }
+
+          # VS package cache: drop payloads but keep instance discovery data.
+          $packages = 'C:\ProgramData\Microsoft\VisualStudio\Packages'
+          if (Test-Path $packages) {
+            Get-ChildItem $packages -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -ne '_Instances' } |
+              ForEach-Object { Remove-Fast $_.FullName }
           }
+
           Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
           Show-Free
+
+      - name: Verify Visual Studio is still found
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path $vswhere)) { throw 'vswhere.exe is missing' }
+          $installs = & $vswhere -latest -products * -property installationPath
+          if (-not $installs) { throw 'vswhere cannot find Visual Studio after cleanup' }
+          Write-Host "Visual Studio: $installs"
 
       - name: Get repository name
         shell: bash
