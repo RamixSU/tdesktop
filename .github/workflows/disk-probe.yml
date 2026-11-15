@@ -1,0 +1,39 @@
+name: Disk probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    steps:
+      - name: Report disks and big folders
+        shell: pwsh
+        run: |
+          Get-Volume | Format-Table -AutoSize | Out-String -Width 220
+          Get-PSDrive -PSProvider FileSystem |
+            Format-Table -AutoSize | Out-String -Width 220
+          function Show-Size($path) {
+            if (-not (Test-Path $path)) { return }
+            $sum = (Get-ChildItem $path -Recurse -Force -ErrorAction SilentlyContinue |
+              Measure-Object Length -Sum).Sum
+            [pscustomobject]@{
+              Path = $path
+              GB = [math]::Round(($sum / 1GB), 2)
+            }
+          }
+          $paths = @(
+            'C:\Program Files',
+            'C:\Program Files (x86)',
+            'C:\ProgramData',
+            'C:\hostedtoolcache',
+            'C:\actions-runner',
+            'C:\Users\runneradmin'
+          )
+          $rows = foreach ($p in $paths) {
+            Get-ChildItem $p -Directory -Force -ErrorAction SilentlyContinue |
+              ForEach-Object { Show-Size $_.FullName }
+          }
+          $rows | Sort-Object GB -Descending |
+            Select-Object -First 25 |
+            Format-Table -AutoSize | Out-String -Width 220
