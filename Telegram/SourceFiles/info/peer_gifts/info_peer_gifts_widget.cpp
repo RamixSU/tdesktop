@@ -723,6 +723,7 @@ void InnerWidget::loadMore() {
 void InnerWidget::loaded(const MTPpayments_SavedStarGifts &result) {
 	const auto &data = result.data();
 
+	const auto firstPage = _offset.isEmpty();
 	_loadMoreRequestId = 0;
 	_collectionsLoadedCallback = nullptr;
 	if (const auto enabled = data.vchat_notifications_enabled()) {
@@ -765,6 +766,40 @@ void InnerWidget::loaded(const MTPpayments_SavedStarGifts &result) {
 				.descriptor = std::move(descriptor),
 			});
 			hasUnique = (parsed->info.unique != nullptr);
+		}
+	}
+	if (firstPage
+		&& !descriptor.collectionId
+		&& !filter.skipsSomething()
+		&& _peer->isUser()) {
+		// Phantom economy: gifts "sent" by this client only exist locally, so
+		// prepend them to the profile gifts list.
+		auto fakes = Api::FakeSentGifts(_peer->id);
+		if (!fakes.empty()) {
+			ranges::stable_sort(fakes, [](const auto &a, const auto &b) {
+				return a.date > b.date;
+			});
+			auto prepend = std::vector<Entry>();
+			prepend.reserve(fakes.size());
+			for (auto &fake : fakes) {
+				const auto duplicate = (ranges::find(
+					*_list,
+					fake.manageId,
+					[](const Entry &entry) { return entry.gift.manageId; }
+				) != end(*_list));
+				if (duplicate) {
+					continue;
+				}
+				auto entry = Entry{ .gift = std::move(fake) };
+				entry.descriptor = DescriptorForGift(_peer, entry.gift);
+				prepend.push_back(std::move(entry));
+			}
+			if (!prepend.empty()) {
+				for (const auto &entry : prepend) {
+					hasUnique = hasUnique || (entry.gift.info.unique != nullptr);
+				}
+				_list->insert(_list->begin(), prepend.begin(), prepend.end());
+			}
 		}
 	}
 	if (_entries->allLoaded) {

@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "data/components/credits.h"
 
+#include "fake_economy.h"
 #include "apiwrap.h"
 #include "api/api_credits.h"
 #include "data/data_user.h"
@@ -83,7 +84,7 @@ rpl::producer<bool> Credits::loadedValue() const {
 }
 
 CreditsAmount Credits::balance() const {
-	return _nonLockedBalance.current();
+	return FakeEconomy::balance(_nonLockedBalance.current());
 }
 
 CreditsAmount Credits::balance(PeerId peerId) const {
@@ -143,7 +144,7 @@ rpl::producer<bool> Credits::tonLoadedValue() const {
 }
 
 CreditsAmount Credits::tonBalance() const {
-	return _tonBalance.current();
+	return FakeEconomy::tonBalance(_tonBalance.current());
 }
 
 rpl::producer<CreditsAmount> Credits::tonBalanceValue() const {
@@ -189,6 +190,7 @@ void Credits::invalidate() {
 }
 
 void Credits::apply(CreditsAmount balance) {
+	balance = FakeEconomy::balance(balance);
 	if (balance.ton()) {
 		_tonBalance = balance;
 

@@ -1,0 +1,121 @@
+# Builds the phantom-economy Telegram Desktop for Windows x64 (Release) on
+# GitHub Actions and uploads a portable zip with the launcher.
+#
+# How to use:
+#   1. Fork https://github.com/telegramdesktop/tdesktop (or push this tree).
+#   2. Copy phantom_economy.patch to the repository root.
+#   3. Copy this file to .github/workflows/phantom-windows.yml.
+#   4. Actions -> "Phantom Windows Release" -> Run workflow.
+#   5. Download the Phantom-Telegram-Windows-x64 artifact.
+#
+# The job mirrors the stock win.yml pipeline: prepare all libraries, configure
+# with Release, build, then pack out\Release together with launcher\*.
+name: Phantom Windows Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows x64 Release
+    runs-on: windows-latest
+    env:
+      UPLOAD_ARTIFACT: "true"
+      TBUILD: ${{ github.workspace }}\TBuild
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - name: Prepare directories
+        run: |
+          mkdir %userprofile%\TBuild\Libraries
+          mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+
+      - name: Get repository name
+        shell: bash
+        run: echo "REPO_NAME=${GITHUB_REPOSITORY##*/}" >> $GITHUB_ENV
+
+      - name: Clone
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          path: ${{ env.TBUILD }}\${{ github.event.repository.name }}
+
+      - uses: Eden-CI/msvc-dev-cmd@master
+        name: Native Tools Command Prompt
+        with:
+          arch: x64
+
+      - name: NuGet sources
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      - name: ThirdParty cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: ${{ runner.os }}-phantom-third-party-v1
+          restore-keys: ${{ runner.os }}-phantom-third-party-
+
+      - name: Libraries cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.TBUILD }}\Libraries\win64\*
+            !${{ env.TBUILD }}\Libraries\win64\cache_keys
+          key: ${{ runner.os }}-phantom-libs-v1
+          restore-keys: ${{ runner.os }}-phantom-libs-
+
+      - name: Apply phantom patch
+        shell: bash
+        run: |
+          cd "$TBUILD/$REPO_NAME"
+          if git apply --reverse --check phantom_economy.patch 2>/dev/null; then
+            echo "Patch is already applied in this tree."
+          else
+            git apply --whitespace=nowarn phantom_economy.patch
+          fi
+
+      - name: Libraries
+        run: |
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat skip-release silent
+
+      - name: Configure
+        run: |
+          cd %TBUILD%\%REPO_NAME%\Telegram
+          call configure.bat x64 ^
+            -D TDESKTOP_API_ID=611335 ^
+            -D TDESKTOP_API_HASH=d524b414d21f4d37f08684c1df41ac9c ^
+            -D CMAKE_CONFIGURATION_TYPES=Release ^
+            -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
+            -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON ^
+            -D DESKTOP_APP_ENABLE_LTO=OFF
+
+      - name: Build
+        run: cmake --build %TBUILD%\%REPO_NAME%\out --config Release --parallel
+
+      - name: Package portable
+        shell: pwsh
+        run: |
+          $root = "$env:TBUILD\$env:REPO_NAME"
+          $out = Join-Path $root 'out\Release'
+          if (-not (Test-Path (Join-Path $out 'Telegram.exe'))) {
+            throw "Telegram.exe was not produced in $out"
+          }
+          $dist = Join-Path $env:TBUILD 'Phantom-Telegram'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item (Join-Path $out '*.exe') $dist -Force
+          Copy-Item (Join-Path $out '*.dll') $dist -Force -ErrorAction SilentlyContinue
+          Copy-Item (Join-Path $root 'launcher\*') $dist -Force -ErrorAction SilentlyContinue
+          $zip = Join-Path $env:TBUILD 'Phantom-Telegram-Windows-x64.zip'
+          Compress-Archive -Path (Join-Path $dist '*') -DestinationPath $zip -Force
+          "ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Phantom-Telegram-Windows-x64
+          path: ${{ env.TBUILD }}\Phantom-Telegram-Windows-x64.zip
+          retention-days: 30

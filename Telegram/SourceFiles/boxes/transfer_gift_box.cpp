@@ -7,9 +7,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "boxes/transfer_gift_box.h"
 
+#include "fake_economy.h"
 #include "apiwrap.h"
 #include "api/api_cloud_password.h"
 #include "api/api_credits.h"
+#include "api/api_premium.h"
 #include "api/api_text_entities.h"
 #include "base/call_delayed.h"
 #include "base/unixtime.h"
@@ -55,6 +57,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/wrap/slide_wrap.h"
 #include "ui/wrap/vertical_layout.h"
 #include "ui/basic_click_handlers.h"
+#include "ui/boxes/boost_box.h" // Ui::StartFireworks.
 #include "ui/empty_userpic.h"
 #include "ui/painter.h"
 #include "ui/vertical_list.h"
@@ -63,6 +66,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "wallet/wallet_panel.h"
 #include "wallet/wallet_session.h"
 #include "window/window_session_controller.h"
+#include "mainwindow.h"
 #include "styles/style_boxes.h" // peerListSingleRow.
 #include "styles/style_chat.h"
 #include "styles/style_chat_helpers.h"
@@ -1093,6 +1097,101 @@ void Controller::rowClicked(not_null<PeerListRow*> row) {
 	});
 }
 
+void AddFakeSentUniqueMessage(
+		not_null<Main::Session*> session,
+		not_null<PeerData*> to,
+		const Data::UniqueGift &gift,
+		const TextWithEntities &message,
+		bool anonymous) {
+	const auto raw = Api::PremiumGiftCodeOptions::rawStarGiftUnique(gift.id);
+	if (!raw) {
+		return;
+	}
+	const auto history = session->data().history(to);
+	const auto transferStars = (gift.starsForTransfer >= 0)
+		? gift.starsForTransfer
+		: FakeEconomy::transferStars();
+	const auto resaleStars = (gift.starsForResale > 0)
+		? gift.starsForResale
+		: 0;
+	using Flag = MTPDmessageActionStarGiftUnique::Flag;
+	auto flags = Flag::f_from_id
+		| Flag::f_peer
+		| Flag::f_transferred
+		| Flag::f_transfer_stars;
+	if (anonymous) {
+		flags |= Flag::f_name_hidden;
+	}
+	if (!message.empty()) {
+		flags |= Flag::f_message;
+	}
+	if (resaleStars > 0) {
+		flags |= Flag::f_resale_amount;
+	}
+	const auto action = MTP_messageActionStarGiftUnique(
+		MTP_flags(flags),
+		*raw,
+		MTPint(), // can_export_at
+		MTP_long(transferStars), // transfer_stars
+		peerToMTP(session->userPeerId()),
+		peerToMTP(to->id),
+		MTP_long(0), // saved_id
+		(resaleStars > 0)
+			? MTP_starsAmount(MTP_long(resaleStars), MTP_int(0))
+			: MTPStarsAmount(), // resale_amount
+		MTPint(), // can_transfer_at
+		MTPint(), // can_resell_at
+		MTP_long(0), // drop_original_details_stars
+		MTPint(), // can_craft_at
+		message.empty()
+			? MTPTextWithEntities()
+			: MTP_textWithEntities(
+				MTP_string(message.text),
+				Api::EntitiesToMTP(
+					session,
+					message.entities,
+					Api::ConvertOption::SkipLocal)));
+
+	using ServiceFlag = MTPDmessageService::Flag;
+	const auto service = MTP_messageService(
+		MTP_flags(ServiceFlag::f_out | ServiceFlag::f_from_id),
+		MTP_int(0),
+		peerToMTP(session->userPeerId()),
+		peerToMTP(to->id),
+		MTPPeer(),
+		MTPMessageReplyHeader(),
+		MTP_int(base::unixtime::now()),
+		action,
+		MTPMessageReactions(),
+		MTPint());
+
+	const auto localId = session->data().nextLocalMessageId();
+	const auto item = history->makeMessage(
+		localId,
+		service.c_messageService(),
+		MessageFlag::Local);
+	history->addNewLocalMessage(item);
+
+	// Phantom economy: the data the server would return for the new owner.
+	auto info = Data::StarGift{
+		.id = gift.id,
+		.unique = std::make_shared<Data::UniqueGift>(gift),
+		.document = gift.model.document,
+	};
+	info.unique->ownerId = to->id;
+	info.unique->ownerName = QString();
+	info.unique->ownerAddress = QString();
+	info.unique->starsForTransfer = transferStars;
+	Api::RememberFakeSentGift(to, Data::SavedStarGift{
+		.info = std::move(info),
+		.manageId = Data::SavedStarGiftId::User(localId),
+		.message = message,
+		.fromId = session->userPeerId(),
+		.date = base::unixtime::now(),
+		.anonymous = anonymous,
+	});
+}
+
 void TransferGift(
 		not_null<Window::SessionController*> window,
 		not_null<PeerData*> to,
@@ -1102,6 +1201,7 @@ void TransferGift(
 		bool skipPaymentForm = false) {
 	const auto session = &window->session();
 	const auto weak = base::make_weak(window);
+	const auto cardAdded = std::make_shared<bool>(false);
 	auto formDone = [=](
 			Payments::CheckoutResult result,
 			const MTPUpdates *updates) {
@@ -1110,8 +1210,18 @@ void TransferGift(
 			TransferGift(window, to, gift, savedId, done, true);
 			return;
 		}
+		if (result == Payments::CheckoutResult::Paid
+			&& FakeEconomy::enabled()
+			&& !*cardAdded) {
+			*cardAdded = true;
+			AddFakeSentUniqueMessage(session, to, *gift, {}, false);
+		}
 		done(result);
 		if (result == Payments::CheckoutResult::Paid) {
+			if (FakeEconomy::enabled()) {
+				// Built-in full-window animation, no extra assets required.
+				Ui::StartFireworks(window->widget());
+			}
 			session->data().notifyGiftUpdate({
 				.id = savedId,
 				.action = Data::GiftUpdate::Action::Transfer,
@@ -1121,6 +1231,10 @@ void TransferGift(
 			}
 		}
 	};
+	if (FakeEconomy::enabled()) {
+		formDone(Payments::CheckoutResult::Paid, nullptr);
+		return;
+	}
 	if (skipPaymentForm) {
 		// We can't check (gift->starsForTransfer <= 0) here.
 		//
@@ -1218,6 +1332,31 @@ void BuyResaleGift(
 		std::shared_ptr<ChatHelpers::Show> show,
 		ResaleGiftPurchase purchase,
 		Fn<void(Payments::CheckoutResult)> done) {
+	if (FakeEconomy::enabled()) {
+		// Inject the card while the resale price is still known, otherwise the
+		// info box would show it as free.
+		AddFakeSentUniqueMessage(
+			&show->session(),
+			purchase.recipient,
+			*purchase.gift,
+			purchase.message,
+			purchase.hideName);
+		purchase.gift->starsForResale = 0;
+		purchase.recipient->owner().notifyGiftUpdate({
+			.slug = purchase.slug,
+			.action = Data::GiftUpdate::Action::ResaleChange,
+		});
+		Ui::ShowResaleGiftBoughtToast(
+			show,
+			purchase.recipient,
+			*purchase.gift);
+		if (const auto window = show->resolveWindow()) {
+			// Built-in full-window animation, no extra assets required.
+			Ui::StartFireworks(window->widget());
+		}
+		done(Payments::CheckoutResult::Paid);
+		return;
+	}
 	const auto invoice = InputInvoiceForResale(purchase);
 	const auto completed = std::make_shared<bool>(false);
 	auto paymentDone = [=](

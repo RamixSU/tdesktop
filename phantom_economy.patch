@@ -1,0 +1,802 @@
+diff --git a/Telegram/SourceFiles/api/api_premium.cpp b/Telegram/SourceFiles/api/api_premium.cpp
+index e306dc012..859a2357d 100644
+--- a/Telegram/SourceFiles/api/api_premium.cpp
++++ b/Telegram/SourceFiles/api/api_premium.cpp
+@@ -12,6 +12,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "apiwrap.h"
+ #include "base/random.h"
+ #include "data/data_channel.h"
++#include "data/data_changes.h"
+ #include "data/data_document.h"
+ #include "data/data_peer.h"
+ #include "data/data_peer_values.h"
+@@ -29,6 +30,36 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ namespace Api {
+ namespace {
+ 
++// Phantom economy: the catalog is requested through throwaway
++// PremiumGiftCodeOptions instances (per gifts-list provider), so keep the raw
++// MTP entries process-wide, keyed by gift id, for local message injection.
++std::vector<MTPStarGift> RawStarGifts;
++
++[[nodiscard]] std::pair<int, uint64> RawStarGiftKey(const MTPStarGift &gift) {
++	return gift.match([&](const MTPDstarGift &data) {
++		return std::pair<int, uint64>(0, uint64(data.vid().v));
++	}, [&](const MTPDstarGiftUnique &data) {
++		return std::pair<int, uint64>(1, uint64(data.vid().v));
++	});
++}
++
++void RememberRawStarGift(const MTPStarGift &gift) {
++	const auto key = RawStarGiftKey(gift);
++	for (auto &stored : RawStarGifts) {
++		if (RawStarGiftKey(stored) == key) {
++			stored = gift;
++			return;
++		}
++	}
++	RawStarGifts.push_back(gift);
++}
++
++void StoreRawStarGifts(const QVector<MTPStarGift> &list) {
++	for (const auto &gift : list) {
++		RememberRawStarGift(gift);
++	}
++}
++
+ [[nodiscard]] GiftCode Parse(const MTPDpayments_checkedGiftCode &data) {
+ 	return {
+ 		.from = data.vfrom_id() ? peerFromMTP(*data.vfrom_id()) : PeerId(),
+@@ -728,6 +759,7 @@ auto PremiumGiftCodeOptions::requestStarGifts()
+ 					}
+ 				}
+ 				_gifts = std::move(gifts);
++				StoreRawStarGifts(list);
+ 			}, [&](const MTPDpayments_starGiftsNotModified &) {
+ 			});
+ 			consumer.put_done();
+@@ -744,6 +776,38 @@ auto PremiumGiftCodeOptions::starGifts() const
+ 	return _gifts;
+ }
+ 
++const MTPStarGift *PremiumGiftCodeOptions::rawStarGift(uint64 id) {
++	for (const auto &gift : RawStarGifts) {
++		const auto match = gift.match([&](const MTPDstarGift &data) {
++			return (uint64(data.vid().v) == id);
++		}, [](const MTPDstarGiftUnique &) {
++			return false;
++		});
++		if (match) {
++			return &gift;
++		}
++	}
++	return nullptr;
++}
++
++const MTPStarGift *PremiumGiftCodeOptions::rawStarGiftUnique(uint64 uniqueId) {
++	for (const auto &gift : RawStarGifts) {
++		const auto match = gift.match([](const MTPDstarGift &) {
++			return false;
++		}, [&](const MTPDstarGiftUnique &data) {
++			return (uint64(data.vid().v) == uniqueId);
++		});
++		if (match) {
++			return &gift;
++		}
++	}
++	return nullptr;
++}
++
++void PremiumGiftCodeOptions::rememberStarGift(const MTPStarGift &gift) {
++	RememberRawStarGift(gift);
++}
++
+ int PremiumGiftCodeOptions::giveawayBoostsPerPremium() const {
+ 	constexpr auto kFallbackCount = 4;
+ 	return _peer->session().appConfig().get<int>(
+@@ -1172,4 +1236,25 @@ Data::UniqueGiftOriginalDetails FromTL(
+ 	return result;
+ }
+ 
++namespace {
++
++// Phantom economy: gifts that were locally "sent" this session. The server
++// never sees them, so they are kept here to be injected into the recipient
++// profile gifts list and into any other local consumer.
++base::flat_map<uint64, std::vector<Data::SavedStarGift>> FakeSentGiftList;
++
++} // namespace
++
++void RememberFakeSentGift(not_null<PeerData*> to, Data::SavedStarGift gift) {
++	FakeSentGiftList[to->id.value].push_back(std::move(gift));
++	to->session().changes().peerUpdated(to, Data::PeerUpdate::Flag::PeerGifts);
++}
++
++std::vector<Data::SavedStarGift> FakeSentGifts(PeerId to) {
++	const auto i = FakeSentGiftList.find(to.value);
++	return (i != end(FakeSentGiftList))
++		? i->second
++		: std::vector<Data::SavedStarGift>();
++}
++
+ } // namespace Api
+diff --git a/Telegram/SourceFiles/api/api_premium.h b/Telegram/SourceFiles/api/api_premium.h
+index a285e4ce0..232861adc 100644
+--- a/Telegram/SourceFiles/api/api_premium.h
++++ b/Telegram/SourceFiles/api/api_premium.h
+@@ -228,6 +228,12 @@ public:
+ 	[[nodiscard]] rpl::producer<rpl::no_value, QString> requestStarGifts();
+ 	[[nodiscard]] const std::vector<Data::StarGift> &starGifts() const;
+ 
++	// Phantom economy: raw catalog entries survive the per-provider instances,
++	// so a locally injected gift message can reuse the exact MTPStarGift.
++	[[nodiscard]] static const MTPStarGift *rawStarGift(uint64 id);
++	[[nodiscard]] static const MTPStarGift *rawStarGiftUnique(uint64 uniqueId);
++	static void rememberStarGift(const MTPStarGift &gift);
++
+ private:
+ 	struct Token final {
+ 		int users = 0;
+@@ -314,4 +320,8 @@ struct MessageMoneyRestriction {
+ 	not_null<Main::Session*> session,
+ 	const MTPDstarGiftAttributeOriginalDetails &data);
+ 
++// Phantom economy: locally "sent" gifts kept for the recipient profile.
++void RememberFakeSentGift(not_null<PeerData*> to, Data::SavedStarGift gift);
++[[nodiscard]] std::vector<Data::SavedStarGift> FakeSentGifts(PeerId to);
++
+ } // namespace Api
+diff --git a/Telegram/SourceFiles/boxes/star_gift_box.cpp b/Telegram/SourceFiles/boxes/star_gift_box.cpp
+index b24ca9d61..64ad0304f 100644
+--- a/Telegram/SourceFiles/boxes/star_gift_box.cpp
++++ b/Telegram/SourceFiles/boxes/star_gift_box.cpp
+@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "boxes/star_gift_box.h"
+ 
++#include "fake_economy.h"
+ #include "boxes/star_gift_cover_box.h"
+ 
+ #include "apiwrap.h"
+@@ -109,6 +110,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "window/themes/window_theme.h"
+ #include "window/section_widget.h"
+ #include "window/window_session_controller.h"
++#include "mainwindow.h"
+ #include "styles/style_boxes.h"
+ #include "styles/style_chat.h"
+ #include "styles/style_chat_helpers.h"
+@@ -1178,12 +1180,122 @@ struct GiftPriceTabs {
+ 		255);
+ }
+ 
++void AddFakeSentGiftMessage(
++		not_null<Window::SessionController*> window,
++		not_null<PeerData*> peer,
++		const GiftTypeStars &gift,
++		const GiftSendDetails &details) {
++	const auto raw = Api::PremiumGiftCodeOptions::rawStarGift(gift.info.id);
++	if (!raw) {
++		return;
++	}
++	const auto session = &window->session();
++	const auto history = session->data().history(peer);
++	const auto messageText = [&]() -> MTPTextWithEntities {
++		if (details.text.empty()) {
++			return MTPTextWithEntities();
++		}
++		return MTP_textWithEntities(
++			MTP_string(details.text.text),
++			Api::EntitiesToMTP(
++				session,
++				details.text.entities,
++				Api::ConvertOption::SkipLocal));
++	};
++
++	using ActionFlag = MTPDmessageActionStarGift::Flag;
++	const auto convertStars = (gift.info.starsConverted > 0)
++		? gift.info.starsConverted
++		: std::max<int64>(gift.info.stars, 1);
++	auto actionFlags = ActionFlag::f_from_id
++		| ActionFlag::f_peer
++		| ActionFlag::f_convert_stars;
++	if (details.anonymous) {
++		actionFlags |= ActionFlag::f_name_hidden;
++	}
++	if (!details.text.empty()) {
++		actionFlags |= ActionFlag::f_message;
++	}
++	const auto action = MTP_messageActionStarGift(
++		MTP_flags(actionFlags),
++		*raw,
++		messageText(),
++		MTP_long(convertStars), // convert_stars
++		MTPint(), // upgrade_msg_id
++		MTP_long(0), // upgrade_stars
++		peerToMTP(session->userPeerId()),
++		peerToMTP(peer->id),
++		MTP_long(0), // saved_id
++		MTPstring(), // prepaid_upgrade_hash
++		MTPint(), // gift_msg_id
++		MTPPeer(), // to_id
++		MTPint()); // gift_num
++
++	using ServiceFlag = MTPDmessageService::Flag;
++	const auto message = MTP_messageService(
++		MTP_flags(ServiceFlag::f_out | ServiceFlag::f_from_id),
++		MTP_int(0), // id, replaced by the MsgId argument
++		peerToMTP(session->userPeerId()), // from_id
++		peerToMTP(peer->id), // peer_id
++		MTPPeer(), // saved_peer_id
++		MTPMessageReplyHeader(), // reply_to
++		MTP_int(base::unixtime::now()), // date
++		action,
++		MTPMessageReactions(), // reactions
++		MTPint()); // ttl_period
++
++	const auto localId = session->data().nextLocalMessageId();
++	const auto item = history->makeMessage(
++		localId,
++		message.c_messageService(),
++		MessageFlag::Local);
++	history->addNewLocalMessage(item);
++
++	// Phantom economy: also show it in the recipient profile gifts list.
++	auto info = gift.info;
++	if (info.starsConverted <= 0) {
++		info.starsConverted = convertStars;
++	}
++	if (info.unique) {
++		info.unique = std::make_shared<Data::UniqueGift>(*info.unique);
++		info.unique->ownerId = peer->id;
++		info.unique->ownerName = QString();
++		info.unique->ownerAddress = QString();
++		if (info.unique->starsForTransfer < 0) {
++			info.unique->starsForTransfer = FakeEconomy::transferStars();
++		}
++	}
++	Api::RememberFakeSentGift(peer, Data::SavedStarGift{
++		.info = std::move(info),
++		.manageId = Data::SavedStarGiftId::User(localId),
++		.message = details.text,
++		.fromId = session->userPeerId(),
++		.date = base::unixtime::now(),
++		.anonymous = details.anonymous,
++	});
++}
++
+ void SendGift(
+ 		not_null<Window::SessionController*> window,
+ 		not_null<PeerData*> peer,
+ 		std::shared_ptr<Api::PremiumGiftCodeOptions> api,
+ 		const GiftSendDetails &details,
+ 		Fn<void(Payments::CheckoutResult)> done) {
++	if (FakeEconomy::enabled()) {
++		const auto price = v::match(details.descriptor, [&](const GiftTypePremium &gift) {
++			return int64(gift.stars);
++		}, [&](const GiftTypeStars &gift) {
++			return gift.info.stars + (details.upgraded ? gift.info.starsToUpgrade : 0);
++		});
++		FakeEconomy::spend(price);
++		if (const auto gift = std::get_if<GiftTypeStars>(&details.descriptor)) {
++			AddFakeSentGiftMessage(window, peer, *gift, details);
++		}
++		// Use the built-in full-window animation (no external assets needed).
++		Ui::StartFireworks(window->widget());
++		done(Payments::CheckoutResult::Paid);
++		return;
++	}
+ 	const auto processNonPanelPaymentFormFactory
+ 		= Payments::ProcessNonPanelPaymentFormFactory(window, done);
+ 	v::match(details.descriptor, [&](const GiftTypePremium &gift) {
+@@ -1267,6 +1379,10 @@ void SendStarsFormRequest(
+ 		MTPInputInvoice invoice,
+ 		Fn<void(Payments::CheckoutResult, const MTPUpdates *)> done) {
+ 	using BalanceResult = Settings::SmallBalanceResult;
++	if (FakeEconomy::enabled()) {
++		done(Payments::CheckoutResult::Paid, nullptr);
++		return;
++	}
+ 	const auto session = &show->session();
+ 	if (result == BalanceResult::Success
+ 		|| result == BalanceResult::Already) {
+@@ -4682,6 +4798,15 @@ void DefaultGiftHandler(
+ 		}
+ 		state->transferRequested = unique;
+ 		const auto savedId = star->transferId;
++		if (FakeEconomy::enabled()) {
++			// No server form, so no real transfer price either: use a sane
++			// local one and go straight to the confirmation box.
++			if (unique->starsForTransfer < 0) {
++				unique->starsForTransfer = FakeEconomy::transferStars();
++			}
++			ShowTransferToBox(window, peer, unique, savedId, done);
++			return;
++		}
+ 		using Payments::CheckoutResult;
+ 		const auto formReady = [=](
+ 				uint64 formId,
+diff --git a/Telegram/SourceFiles/boxes/transfer_gift_box.cpp b/Telegram/SourceFiles/boxes/transfer_gift_box.cpp
+index 4240b0db1..a067beada 100644
+--- a/Telegram/SourceFiles/boxes/transfer_gift_box.cpp
++++ b/Telegram/SourceFiles/boxes/transfer_gift_box.cpp
+@@ -7,9 +7,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "boxes/transfer_gift_box.h"
+ 
++#include "fake_economy.h"
+ #include "apiwrap.h"
+ #include "api/api_cloud_password.h"
+ #include "api/api_credits.h"
++#include "api/api_premium.h"
+ #include "api/api_text_entities.h"
+ #include "base/call_delayed.h"
+ #include "base/unixtime.h"
+@@ -55,6 +57,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "ui/wrap/slide_wrap.h"
+ #include "ui/wrap/vertical_layout.h"
+ #include "ui/basic_click_handlers.h"
++#include "ui/boxes/boost_box.h" // Ui::StartFireworks.
+ #include "ui/empty_userpic.h"
+ #include "ui/painter.h"
+ #include "ui/vertical_list.h"
+@@ -63,6 +66,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "wallet/wallet_panel.h"
+ #include "wallet/wallet_session.h"
+ #include "window/window_session_controller.h"
++#include "mainwindow.h"
+ #include "styles/style_boxes.h" // peerListSingleRow.
+ #include "styles/style_chat.h"
+ #include "styles/style_chat_helpers.h"
+@@ -1093,6 +1097,101 @@ void Controller::rowClicked(not_null<PeerListRow*> row) {
+ 	});
+ }
+ 
++void AddFakeSentUniqueMessage(
++		not_null<Main::Session*> session,
++		not_null<PeerData*> to,
++		const Data::UniqueGift &gift,
++		const TextWithEntities &message,
++		bool anonymous) {
++	const auto raw = Api::PremiumGiftCodeOptions::rawStarGiftUnique(gift.id);
++	if (!raw) {
++		return;
++	}
++	const auto history = session->data().history(to);
++	const auto transferStars = (gift.starsForTransfer >= 0)
++		? gift.starsForTransfer
++		: FakeEconomy::transferStars();
++	const auto resaleStars = (gift.starsForResale > 0)
++		? gift.starsForResale
++		: 0;
++	using Flag = MTPDmessageActionStarGiftUnique::Flag;
++	auto flags = Flag::f_from_id
++		| Flag::f_peer
++		| Flag::f_transferred
++		| Flag::f_transfer_stars;
++	if (anonymous) {
++		flags |= Flag::f_name_hidden;
++	}
++	if (!message.empty()) {
++		flags |= Flag::f_message;
++	}
++	if (resaleStars > 0) {
++		flags |= Flag::f_resale_amount;
++	}
++	const auto action = MTP_messageActionStarGiftUnique(
++		MTP_flags(flags),
++		*raw,
++		MTPint(), // can_export_at
++		MTP_long(transferStars), // transfer_stars
++		peerToMTP(session->userPeerId()),
++		peerToMTP(to->id),
++		MTP_long(0), // saved_id
++		(resaleStars > 0)
++			? MTP_starsAmount(MTP_long(resaleStars), MTP_int(0))
++			: MTPStarsAmount(), // resale_amount
++		MTPint(), // can_transfer_at
++		MTPint(), // can_resell_at
++		MTP_long(0), // drop_original_details_stars
++		MTPint(), // can_craft_at
++		message.empty()
++			? MTPTextWithEntities()
++			: MTP_textWithEntities(
++				MTP_string(message.text),
++				Api::EntitiesToMTP(
++					session,
++					message.entities,
++					Api::ConvertOption::SkipLocal)));
++
++	using ServiceFlag = MTPDmessageService::Flag;
++	const auto service = MTP_messageService(
++		MTP_flags(ServiceFlag::f_out | ServiceFlag::f_from_id),
++		MTP_int(0),
++		peerToMTP(session->userPeerId()),
++		peerToMTP(to->id),
++		MTPPeer(),
++		MTPMessageReplyHeader(),
++		MTP_int(base::unixtime::now()),
++		action,
++		MTPMessageReactions(),
++		MTPint());
++
++	const auto localId = session->data().nextLocalMessageId();
++	const auto item = history->makeMessage(
++		localId,
++		service.c_messageService(),
++		MessageFlag::Local);
++	history->addNewLocalMessage(item);
++
++	// Phantom economy: the data the server would return for the new owner.
++	auto info = Data::StarGift{
++		.id = gift.id,
++		.unique = std::make_shared<Data::UniqueGift>(gift),
++		.document = gift.model.document,
++	};
++	info.unique->ownerId = to->id;
++	info.unique->ownerName = QString();
++	info.unique->ownerAddress = QString();
++	info.unique->starsForTransfer = transferStars;
++	Api::RememberFakeSentGift(to, Data::SavedStarGift{
++		.info = std::move(info),
++		.manageId = Data::SavedStarGiftId::User(localId),
++		.message = message,
++		.fromId = session->userPeerId(),
++		.date = base::unixtime::now(),
++		.anonymous = anonymous,
++	});
++}
++
+ void TransferGift(
+ 		not_null<Window::SessionController*> window,
+ 		not_null<PeerData*> to,
+@@ -1102,6 +1201,7 @@ void TransferGift(
+ 		bool skipPaymentForm = false) {
+ 	const auto session = &window->session();
+ 	const auto weak = base::make_weak(window);
++	const auto cardAdded = std::make_shared<bool>(false);
+ 	auto formDone = [=](
+ 			Payments::CheckoutResult result,
+ 			const MTPUpdates *updates) {
+@@ -1110,8 +1210,18 @@ void TransferGift(
+ 			TransferGift(window, to, gift, savedId, done, true);
+ 			return;
+ 		}
++		if (result == Payments::CheckoutResult::Paid
++			&& FakeEconomy::enabled()
++			&& !*cardAdded) {
++			*cardAdded = true;
++			AddFakeSentUniqueMessage(session, to, *gift, {}, false);
++		}
+ 		done(result);
+ 		if (result == Payments::CheckoutResult::Paid) {
++			if (FakeEconomy::enabled()) {
++				// Built-in full-window animation, no extra assets required.
++				Ui::StartFireworks(window->widget());
++			}
+ 			session->data().notifyGiftUpdate({
+ 				.id = savedId,
+ 				.action = Data::GiftUpdate::Action::Transfer,
+@@ -1121,6 +1231,10 @@ void TransferGift(
+ 			}
+ 		}
+ 	};
++	if (FakeEconomy::enabled()) {
++		formDone(Payments::CheckoutResult::Paid, nullptr);
++		return;
++	}
+ 	if (skipPaymentForm) {
+ 		// We can't check (gift->starsForTransfer <= 0) here.
+ 		//
+@@ -1218,6 +1332,31 @@ void BuyResaleGift(
+ 		std::shared_ptr<ChatHelpers::Show> show,
+ 		ResaleGiftPurchase purchase,
+ 		Fn<void(Payments::CheckoutResult)> done) {
++	if (FakeEconomy::enabled()) {
++		// Inject the card while the resale price is still known, otherwise the
++		// info box would show it as free.
++		AddFakeSentUniqueMessage(
++			&show->session(),
++			purchase.recipient,
++			*purchase.gift,
++			purchase.message,
++			purchase.hideName);
++		purchase.gift->starsForResale = 0;
++		purchase.recipient->owner().notifyGiftUpdate({
++			.slug = purchase.slug,
++			.action = Data::GiftUpdate::Action::ResaleChange,
++		});
++		Ui::ShowResaleGiftBoughtToast(
++			show,
++			purchase.recipient,
++			*purchase.gift);
++		if (const auto window = show->resolveWindow()) {
++			// Built-in full-window animation, no extra assets required.
++			Ui::StartFireworks(window->widget());
++		}
++		done(Payments::CheckoutResult::Paid);
++		return;
++	}
+ 	const auto invoice = InputInvoiceForResale(purchase);
+ 	const auto completed = std::make_shared<bool>(false);
+ 	auto paymentDone = [=](
+diff --git a/Telegram/SourceFiles/data/components/credits.cpp b/Telegram/SourceFiles/data/components/credits.cpp
+index efae66ad5..37c4f4461 100644
+--- a/Telegram/SourceFiles/data/components/credits.cpp
++++ b/Telegram/SourceFiles/data/components/credits.cpp
+@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "data/components/credits.h"
+ 
++#include "fake_economy.h"
+ #include "apiwrap.h"
+ #include "api/api_credits.h"
+ #include "data/data_user.h"
+@@ -83,7 +84,7 @@ rpl::producer<bool> Credits::loadedValue() const {
+ }
+ 
+ CreditsAmount Credits::balance() const {
+-	return _nonLockedBalance.current();
++	return FakeEconomy::balance(_nonLockedBalance.current());
+ }
+ 
+ CreditsAmount Credits::balance(PeerId peerId) const {
+@@ -143,7 +144,7 @@ rpl::producer<bool> Credits::tonLoadedValue() const {
+ }
+ 
+ CreditsAmount Credits::tonBalance() const {
+-	return _tonBalance.current();
++	return FakeEconomy::tonBalance(_tonBalance.current());
+ }
+ 
+ rpl::producer<CreditsAmount> Credits::tonBalanceValue() const {
+@@ -189,6 +190,7 @@ void Credits::invalidate() {
+ }
+ 
+ void Credits::apply(CreditsAmount balance) {
++	balance = FakeEconomy::balance(balance);
+ 	if (balance.ton()) {
+ 		_tonBalance = balance;
+ 
+diff --git a/Telegram/SourceFiles/data/data_star_gift.cpp b/Telegram/SourceFiles/data/data_star_gift.cpp
+index 5ca31c59d..249e2df19 100644
+--- a/Telegram/SourceFiles/data/data_star_gift.cpp
++++ b/Telegram/SourceFiles/data/data_star_gift.cpp
+@@ -260,6 +260,8 @@ rpl::producer<MyGiftsDescriptor> PeerUniqueGiftsSlice(
+ 			gifts.list.reserve(data.vgifts().v.size());
+ 			for (const auto &gift : data.vgifts().v) {
+ 				if (auto parsed = Api::FromTL(peer, gift)) {
++					Api::PremiumGiftCodeOptions::rememberStarGift(
++						gift.data().vgift());
+ 					gifts.list.push_back(std::move(*parsed));
+ 				}
+ 			}
+@@ -323,6 +325,7 @@ rpl::producer<ResaleGiftsDescriptor> ResaleGiftsSlice(
+ 			info.list.reserve(list.size());
+ 			for (const auto &entry : list) {
+ 				if (auto gift = Api::FromTL(session, entry)) {
++					Api::PremiumGiftCodeOptions::rememberStarGift(entry);
+ 					info.list.push_back(std::move(*gift));
+ 				}
+ 			}
+diff --git a/Telegram/SourceFiles/fake_economy.h b/Telegram/SourceFiles/fake_economy.h
+new file mode 100644
+index 000000000..dfedae49e
+--- /dev/null
++++ b/Telegram/SourceFiles/fake_economy.h
+@@ -0,0 +1,108 @@
++/*
++Phantom economy add-on for Telegram Desktop (local client-side display only).
++
++Overrides the displayed Stars / TON balances and lets gift sends resolve as
++"paid" without any RPC leaving the client. Purely visual: nothing is synced and
++the server never sees a request. Enabled at runtime through environment vars:
++
++    TD_FAKE_ECONOMY=1 TD_FAKE_STARS=999999 TD_FAKE_TON=13370 ./Telegram
++
++Without TD_FAKE_ECONOMY the whole thing is a no-op and behaviour is stock.
++
++Two balance modes are supported:
++
++    TD_FAKE_INFINITE=1          # never decreases, always shows TD_FAKE_STARS
++    TD_FAKE_STARS=inf           # same, alias
++    TD_FAKE_STARS=500           # spends from 500, ticks down per send
++
++The spending mode counts phantom sends locally, so the number falls to 0
++instead of staying fixed. Gifts still resolve as paid, nothing is sent.
++*/
++#pragma once
++
++#include "core/credits_amount.h"
++
++#include <cstdint>
++#include <cstdlib>
++#include <algorithm>
++
++namespace FakeEconomy {
++
++inline bool enabled() {
++	static const bool on = (std::getenv("TD_FAKE_ECONOMY") != nullptr);
++	return on;
++}
++
++// Infinite currency mode: the balance never goes down, no matter how many
++// phantom gifts are sent. Enabled by TD_FAKE_INFINITE=1 or TD_FAKE_STARS=inf.
++inline bool infinite() {
++	static const bool on = [] {
++		if (const auto v = std::getenv("TD_FAKE_INFINITE")) {
++			return (v[0] != '\0' && v[0] != '0');
++		}
++		if (const auto v = std::getenv("TD_FAKE_STARS")) {
++			const auto value = QByteArray(v).toLower();
++			return (value == "inf") || (value == "infinite");
++		}
++		return false;
++	}();
++	return on;
++}
++
++inline int64 stars() {
++	const auto v = std::getenv("TD_FAKE_STARS");
++	if (!v) {
++		return 999999;
++	}
++	const auto value = QByteArray(v).toLower();
++	if (value == "inf" || value == "infinite") {
++		return 999999;
++	}
++	return std::strtoll(v, nullptr, 10);
++}
++
++inline int64 tonWhole() {
++	const auto v = std::getenv("TD_FAKE_TON");
++	return v ? std::strtoll(v, nullptr, 10) : int64(13370);
++}
++
++// Price shown for transferring a phantom unique gift. Real Telegram asks the
++// server for it; locally we use a believable fixed fee (0 = free transfer).
++inline int transferStars() {
++	const auto v = std::getenv("TD_FAKE_TRANSFER_STARS");
++	return v ? int(std::strtol(v, nullptr, 10)) : 25;
++}
++
++// fake amount already "spent" on phantom gifts this session, so the balance
++// ticks down believably instead of looking infinite
++inline int64 &spentStars() {
++	static int64 value = 0;
++	return value;
++}
++
++inline void spend(int64 amount) {
++	if (enabled() && amount > 0) {
++		spentStars() += amount;
++	}
++}
++
++inline CreditsAmount balance(CreditsAmount real) {
++	if (!enabled()) {
++		return real;
++	}
++	if (real.ton()) {
++		return CreditsAmount(tonWhole(), 0, CreditsType::Ton);
++	}
++	if (infinite()) {
++		return CreditsAmount(stars());
++	}
++	return CreditsAmount(std::max<int64>(0, stars() - spentStars()));
++}
++
++inline CreditsAmount tonBalance(CreditsAmount real) {
++	return enabled()
++		? CreditsAmount(tonWhole(), 0, CreditsType::Ton)
++		: real;
++}
++
++} // namespace FakeEconomy
+diff --git a/Telegram/SourceFiles/history/history_item.cpp b/Telegram/SourceFiles/history/history_item.cpp
+index 823e05864..a874295d0 100644
+--- a/Telegram/SourceFiles/history/history_item.cpp
++++ b/Telegram/SourceFiles/history/history_item.cpp
+@@ -82,6 +82,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "data/data_photo.h"
+ #include "data/data_stories.h"
+ #include "data/data_web_page.h"
++#include "fake_economy.h"
+ #include "chat_helpers/stickers_gift_box_pack.h"
+ #include "payments/payments_checkout_process.h" // CheckoutProcess::Start.
+ #include "payments/payments_non_panel_process.h" // ProcessNonPanelPaymentFormFactory.
+@@ -8393,6 +8394,15 @@ void HistoryItem::processAction(const MTPMessageAction &action) {
+ 				unique->canTransferAt = data.vcan_transfer_at().value_or_empty();
+ 				unique->canResellAt = data.vcan_resell_at().value_or_empty();
+ 				unique->canCraftAt = data.vcan_craft_at().value_or_empty();
++				if (isLocal() && FakeEconomy::enabled()) {
++					// Phantom economy: the raw entry was cached from a catalog
++					// or resale list and still points to the previous owner.
++					unique->ownerId = data.vpeer()
++						? peerFromMTP(*data.vpeer())
++						: history()->peer->id;
++					unique->ownerName = QString();
++					unique->ownerAddress = QString();
++				}
+ 			}
+ 		}
+ 		_media = std::make_unique<Data::MediaGiftBox>(
+diff --git a/Telegram/SourceFiles/info/peer_gifts/info_peer_gifts_widget.cpp b/Telegram/SourceFiles/info/peer_gifts/info_peer_gifts_widget.cpp
+index 8e37059e2..45b2023e1 100644
+--- a/Telegram/SourceFiles/info/peer_gifts/info_peer_gifts_widget.cpp
++++ b/Telegram/SourceFiles/info/peer_gifts/info_peer_gifts_widget.cpp
+@@ -723,6 +723,7 @@ void InnerWidget::loadMore() {
+ void InnerWidget::loaded(const MTPpayments_SavedStarGifts &result) {
+ 	const auto &data = result.data();
+ 
++	const auto firstPage = _offset.isEmpty();
+ 	_loadMoreRequestId = 0;
+ 	_collectionsLoadedCallback = nullptr;
+ 	if (const auto enabled = data.vchat_notifications_enabled()) {
+@@ -767,6 +768,40 @@ void InnerWidget::loaded(const MTPpayments_SavedStarGifts &result) {
+ 			hasUnique = (parsed->info.unique != nullptr);
+ 		}
+ 	}
++	if (firstPage
++		&& !descriptor.collectionId
++		&& !filter.skipsSomething()
++		&& _peer->isUser()) {
++		// Phantom economy: gifts "sent" by this client only exist locally, so
++		// prepend them to the profile gifts list.
++		auto fakes = Api::FakeSentGifts(_peer->id);
++		if (!fakes.empty()) {
++			ranges::stable_sort(fakes, [](const auto &a, const auto &b) {
++				return a.date > b.date;
++			});
++			auto prepend = std::vector<Entry>();
++			prepend.reserve(fakes.size());
++			for (auto &fake : fakes) {
++				const auto duplicate = (ranges::find(
++					*_list,
++					fake.manageId,
++					[](const Entry &entry) { return entry.gift.manageId; }
++				) != end(*_list));
++				if (duplicate) {
++					continue;
++				}
++				auto entry = Entry{ .gift = std::move(fake) };
++				entry.descriptor = DescriptorForGift(_peer, entry.gift);
++				prepend.push_back(std::move(entry));
++			}
++			if (!prepend.empty()) {
++				for (const auto &entry : prepend) {
++					hasUnique = hasUnique || (entry.gift.info.unique != nullptr);
++				}
++				_list->insert(_list->begin(), prepend.begin(), prepend.end());
++			}
++		}
++	}
+ 	if (_entries->allLoaded) {
+ 		_entries->total = _entries->list.size();
+ 	}
+diff --git a/Telegram/SourceFiles/info/profile/info_profile_values.cpp b/Telegram/SourceFiles/info/profile/info_profile_values.cpp
+index b5ce17782..5e1af5ed3 100644
+--- a/Telegram/SourceFiles/info/profile/info_profile_values.cpp
++++ b/Telegram/SourceFiles/info/profile/info_profile_values.cpp
+@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "info/profile/info_profile_values.h"
+ 
+ #include "api/api_chat_participants.h"
++#include "api/api_premium.h"
+ #include "apiwrap.h"
+ #include "info/profile/info_profile_phone_menu.h"
+ #include "info/profile/info_profile_badge.h"
+@@ -677,7 +678,12 @@ rpl::producer<int> PeerGiftsCountValue(not_null<PeerData*> peer) {
+ 		peer,
+ 		UpdateFlag::PeerGifts
+ 	) | rpl::map([=] {
+-		return peer->peerGiftsCount();
++		auto result = peer->peerGiftsCount();
++		if (peer->isUser()) {
++			// Phantom economy: locally "sent" gifts are not counted by server.
++			result += int(Api::FakeSentGifts(peer->id).size());
++		}
++		return result;
+ 	});
+ }
+ 

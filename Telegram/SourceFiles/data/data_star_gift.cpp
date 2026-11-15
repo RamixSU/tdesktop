@@ -260,6 +260,8 @@ rpl::producer<MyGiftsDescriptor> PeerUniqueGiftsSlice(
 			gifts.list.reserve(data.vgifts().v.size());
 			for (const auto &gift : data.vgifts().v) {
 				if (auto parsed = Api::FromTL(peer, gift)) {
+					Api::PremiumGiftCodeOptions::rememberStarGift(
+						gift.data().vgift());
 					gifts.list.push_back(std::move(*parsed));
 				}
 			}
@@ -323,6 +325,7 @@ rpl::producer<ResaleGiftsDescriptor> ResaleGiftsSlice(
 			info.list.reserve(list.size());
 			for (const auto &entry : list) {
 				if (auto gift = Api::FromTL(session, entry)) {
+					Api::PremiumGiftCodeOptions::rememberStarGift(entry);
 					info.list.push_back(std::move(*gift));
 				}
 			}

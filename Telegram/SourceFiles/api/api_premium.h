@@ -228,6 +228,12 @@ public:
 	[[nodiscard]] rpl::producer<rpl::no_value, QString> requestStarGifts();
 	[[nodiscard]] const std::vector<Data::StarGift> &starGifts() const;
 
+	// Phantom economy: raw catalog entries survive the per-provider instances,
+	// so a locally injected gift message can reuse the exact MTPStarGift.
+	[[nodiscard]] static const MTPStarGift *rawStarGift(uint64 id);
+	[[nodiscard]] static const MTPStarGift *rawStarGiftUnique(uint64 uniqueId);
+	static void rememberStarGift(const MTPStarGift &gift);
+
 private:
 	struct Token final {
 		int users = 0;
@@ -313,5 +319,9 @@ struct MessageMoneyRestriction {
 [[nodiscard]] Data::UniqueGiftOriginalDetails FromTL(
 	not_null<Main::Session*> session,
 	const MTPDstarGiftAttributeOriginalDetails &data);
+
+// Phantom economy: locally "sent" gifts kept for the recipient profile.
+void RememberFakeSentGift(not_null<PeerData*> to, Data::SavedStarGift gift);
+[[nodiscard]] std::vector<Data::SavedStarGift> FakeSentGifts(PeerId to);
 
 } // namespace Api

@@ -12,6 +12,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "apiwrap.h"
 #include "base/random.h"
 #include "data/data_channel.h"
+#include "data/data_changes.h"
 #include "data/data_document.h"
 #include "data/data_peer.h"
 #include "data/data_peer_values.h"
@@ -28,6 +29,36 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 namespace Api {
 namespace {
+
+// Phantom economy: the catalog is requested through throwaway
+// PremiumGiftCodeOptions instances (per gifts-list provider), so keep the raw
+// MTP entries process-wide, keyed by gift id, for local message injection.
+std::vector<MTPStarGift> RawStarGifts;
+
+[[nodiscard]] std::pair<int, uint64> RawStarGiftKey(const MTPStarGift &gift) {
+	return gift.match([&](const MTPDstarGift &data) {
+		return std::pair<int, uint64>(0, uint64(data.vid().v));
+	}, [&](const MTPDstarGiftUnique &data) {
+		return std::pair<int, uint64>(1, uint64(data.vid().v));
+	});
+}
+
+void RememberRawStarGift(const MTPStarGift &gift) {
+	const auto key = RawStarGiftKey(gift);
+	for (auto &stored : RawStarGifts) {
+		if (RawStarGiftKey(stored) == key) {
+			stored = gift;
+			return;
+		}
+	}
+	RawStarGifts.push_back(gift);
+}
+
+void StoreRawStarGifts(const QVector<MTPStarGift> &list) {
+	for (const auto &gift : list) {
+		RememberRawStarGift(gift);
+	}
+}
 
 [[nodiscard]] GiftCode Parse(const MTPDpayments_checkedGiftCode &data) {
 	return {
@@ -728,6 +759,7 @@ auto PremiumGiftCodeOptions::requestStarGifts()
 					}
 				}
 				_gifts = std::move(gifts);
+				StoreRawStarGifts(list);
 			}, [&](const MTPDpayments_starGiftsNotModified &) {
 			});
 			consumer.put_done();
@@ -742,6 +774,38 @@ auto PremiumGiftCodeOptions::requestStarGifts()
 auto PremiumGiftCodeOptions::starGifts() const
 -> const std::vector<Data::StarGift> & {
 	return _gifts;
+}
+
+const MTPStarGift *PremiumGiftCodeOptions::rawStarGift(uint64 id) {
+	for (const auto &gift : RawStarGifts) {
+		const auto match = gift.match([&](const MTPDstarGift &data) {
+			return (uint64(data.vid().v) == id);
+		}, [](const MTPDstarGiftUnique &) {
+			return false;
+		});
+		if (match) {
+			return &gift;
+		}
+	}
+	return nullptr;
+}
+
+const MTPStarGift *PremiumGiftCodeOptions::rawStarGiftUnique(uint64 uniqueId) {
+	for (const auto &gift : RawStarGifts) {
+		const auto match = gift.match([](const MTPDstarGift &) {
+			return false;
+		}, [&](const MTPDstarGiftUnique &data) {
+			return (uint64(data.vid().v) == uniqueId);
+		});
+		if (match) {
+			return &gift;
+		}
+	}
+	return nullptr;
+}
+
+void PremiumGiftCodeOptions::rememberStarGift(const MTPStarGift &gift) {
+	RememberRawStarGift(gift);
 }
 
 int PremiumGiftCodeOptions::giveawayBoostsPerPremium() const {
@@ -1170,6 +1234,27 @@ Data::UniqueGiftOriginalDetails FromTL(
 		? ParseTextWithEntities(session, *data.vmessage())
 		: TextWithEntities();
 	return result;
+}
+
+namespace {
+
+// Phantom economy: gifts that were locally "sent" this session. The server
+// never sees them, so they are kept here to be injected into the recipient
+// profile gifts list and into any other local consumer.
+base::flat_map<uint64, std::vector<Data::SavedStarGift>> FakeSentGiftList;
+
+} // namespace
+
+void RememberFakeSentGift(not_null<PeerData*> to, Data::SavedStarGift gift) {
+	FakeSentGiftList[to->id.value].push_back(std::move(gift));
+	to->session().changes().peerUpdated(to, Data::PeerUpdate::Flag::PeerGifts);
+}
+
+std::vector<Data::SavedStarGift> FakeSentGifts(PeerId to) {
+	const auto i = FakeSentGiftList.find(to.value);
+	return (i != end(FakeSentGiftList))
+		? i->second
+		: std::vector<Data::SavedStarGift>();
 }
 
 } // namespace Api

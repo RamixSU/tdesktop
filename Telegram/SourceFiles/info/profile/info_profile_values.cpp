@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "info/profile/info_profile_values.h"
 
 #include "api/api_chat_participants.h"
+#include "api/api_premium.h"
 #include "apiwrap.h"
 #include "info/profile/info_profile_phone_menu.h"
 #include "info/profile/info_profile_badge.h"
@@ -677,7 +678,12 @@ rpl::producer<int> PeerGiftsCountValue(not_null<PeerData*> peer) {
 		peer,
 		UpdateFlag::PeerGifts
 	) | rpl::map([=] {
-		return peer->peerGiftsCount();
+		auto result = peer->peerGiftsCount();
+		if (peer->isUser()) {
+			// Phantom economy: locally "sent" gifts are not counted by server.
+			result += int(Api::FakeSentGifts(peer->id).size());
+		}
+		return result;
 	});
 }
 

@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "boxes/star_gift_box.h"
 
+#include "fake_economy.h"
 #include "boxes/star_gift_cover_box.h"
 
 #include "apiwrap.h"
@@ -109,6 +110,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "window/themes/window_theme.h"
 #include "window/section_widget.h"
 #include "window/window_session_controller.h"
+#include "mainwindow.h"
 #include "styles/style_boxes.h"
 #include "styles/style_chat.h"
 #include "styles/style_chat_helpers.h"
@@ -1178,12 +1180,122 @@ struct GiftPriceTabs {
 		255);
 }
 
+void AddFakeSentGiftMessage(
+		not_null<Window::SessionController*> window,
+		not_null<PeerData*> peer,
+		const GiftTypeStars &gift,
+		const GiftSendDetails &details) {
+	const auto raw = Api::PremiumGiftCodeOptions::rawStarGift(gift.info.id);
+	if (!raw) {
+		return;
+	}
+	const auto session = &window->session();
+	const auto history = session->data().history(peer);
+	const auto messageText = [&]() -> MTPTextWithEntities {
+		if (details.text.empty()) {
+			return MTPTextWithEntities();
+		}
+		return MTP_textWithEntities(
+			MTP_string(details.text.text),
+			Api::EntitiesToMTP(
+				session,
+				details.text.entities,
+				Api::ConvertOption::SkipLocal));
+	};
+
+	using ActionFlag = MTPDmessageActionStarGift::Flag;
+	const auto convertStars = (gift.info.starsConverted > 0)
+		? gift.info.starsConverted
+		: std::max<int64>(gift.info.stars, 1);
+	auto actionFlags = ActionFlag::f_from_id
+		| ActionFlag::f_peer
+		| ActionFlag::f_convert_stars;
+	if (details.anonymous) {
+		actionFlags |= ActionFlag::f_name_hidden;
+	}
+	if (!details.text.empty()) {
+		actionFlags |= ActionFlag::f_message;
+	}
+	const auto action = MTP_messageActionStarGift(
+		MTP_flags(actionFlags),
+		*raw,
+		messageText(),
+		MTP_long(convertStars), // convert_stars
+		MTPint(), // upgrade_msg_id
+		MTP_long(0), // upgrade_stars
+		peerToMTP(session->userPeerId()),
+		peerToMTP(peer->id),
+		MTP_long(0), // saved_id
+		MTPstring(), // prepaid_upgrade_hash
+		MTPint(), // gift_msg_id
+		MTPPeer(), // to_id
+		MTPint()); // gift_num
+
+	using ServiceFlag = MTPDmessageService::Flag;
+	const auto message = MTP_messageService(
+		MTP_flags(ServiceFlag::f_out | ServiceFlag::f_from_id),
+		MTP_int(0), // id, replaced by the MsgId argument
+		peerToMTP(session->userPeerId()), // from_id
+		peerToMTP(peer->id), // peer_id
+		MTPPeer(), // saved_peer_id
+		MTPMessageReplyHeader(), // reply_to
+		MTP_int(base::unixtime::now()), // date
+		action,
+		MTPMessageReactions(), // reactions
+		MTPint()); // ttl_period
+
+	const auto localId = session->data().nextLocalMessageId();
+	const auto item = history->makeMessage(
+		localId,
+		message.c_messageService(),
+		MessageFlag::Local);
+	history->addNewLocalMessage(item);
+
+	// Phantom economy: also show it in the recipient profile gifts list.
+	auto info = gift.info;
+	if (info.starsConverted <= 0) {
+		info.starsConverted = convertStars;
+	}
+	if (info.unique) {
+		info.unique = std::make_shared<Data::UniqueGift>(*info.unique);
+		info.unique->ownerId = peer->id;
+		info.unique->ownerName = QString();
+		info.unique->ownerAddress = QString();
+		if (info.unique->starsForTransfer < 0) {
+			info.unique->starsForTransfer = FakeEconomy::transferStars();
+		}
+	}
+	Api::RememberFakeSentGift(peer, Data::SavedStarGift{
+		.info = std::move(info),
+		.manageId = Data::SavedStarGiftId::User(localId),
+		.message = details.text,
+		.fromId = session->userPeerId(),
+		.date = base::unixtime::now(),
+		.anonymous = details.anonymous,
+	});
+}
+
 void SendGift(
 		not_null<Window::SessionController*> window,
 		not_null<PeerData*> peer,
 		std::shared_ptr<Api::PremiumGiftCodeOptions> api,
 		const GiftSendDetails &details,
 		Fn<void(Payments::CheckoutResult)> done) {
+	if (FakeEconomy::enabled()) {
+		const auto price = v::match(details.descriptor, [&](const GiftTypePremium &gift) {
+			return int64(gift.stars);
+		}, [&](const GiftTypeStars &gift) {
+			return gift.info.stars + (details.upgraded ? gift.info.starsToUpgrade : 0);
+		});
+		FakeEconomy::spend(price);
+		if (const auto gift = std::get_if<GiftTypeStars>(&details.descriptor)) {
+			AddFakeSentGiftMessage(window, peer, *gift, details);
+		}
+		// Use the built-in full-window animation (no external assets needed).
+		Ui::StartFireworks(window->widget());
+		done(Payments::CheckoutResult::Paid);
+		return;
+	}
 	const auto processNonPanelPaymentFormFactory
 		= Payments::ProcessNonPanelPaymentFormFactory(window, done);
 	v::match(details.descriptor, [&](const GiftTypePremium &gift) {
@@ -1267,6 +1379,10 @@ void SendStarsFormRequest(
 		MTPInputInvoice invoice,
 		Fn<void(Payments::CheckoutResult, const MTPUpdates *)> done) {
 	using BalanceResult = Settings::SmallBalanceResult;
+	if (FakeEconomy::enabled()) {
+		done(Payments::CheckoutResult::Paid, nullptr);
+		return;
+	}
 	const auto session = &show->session();
 	if (result == BalanceResult::Success
 		|| result == BalanceResult::Already) {
@@ -4682,6 +4798,15 @@ void DefaultGiftHandler(
 		}
 		state->transferRequested = unique;
 		const auto savedId = star->transferId;
+		if (FakeEconomy::enabled()) {
+			// No server form, so no real transfer price either: use a sane
+			// local one and go straight to the confirmation box.
+			if (unique->starsForTransfer < 0) {
+				unique->starsForTransfer = FakeEconomy::transferStars();
+			}
+			ShowTransferToBox(window, peer, unique, savedId, done);
+			return;
+		}
 		using Payments::CheckoutResult;
 		const auto formReady = [=](
 				uint64 formId,

@@ -82,6 +82,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_photo.h"
 #include "data/data_stories.h"
 #include "data/data_web_page.h"
+#include "fake_economy.h"
 #include "chat_helpers/stickers_gift_box_pack.h"
 #include "payments/payments_checkout_process.h" // CheckoutProcess::Start.
 #include "payments/payments_non_panel_process.h" // ProcessNonPanelPaymentFormFactory.
@@ -8393,6 +8394,15 @@ void HistoryItem::processAction(const MTPMessageAction &action) {
 				unique->canTransferAt = data.vcan_transfer_at().value_or_empty();
 				unique->canResellAt = data.vcan_resell_at().value_or_empty();
 				unique->canCraftAt = data.vcan_craft_at().value_or_empty();
+				if (isLocal() && FakeEconomy::enabled()) {
+					// Phantom economy: the raw entry was cached from a catalog
+					// or resale list and still points to the previous owner.
+					unique->ownerId = data.vpeer()
+						? peerFromMTP(*data.vpeer())
+						: history()->peer->id;
+					unique->ownerName = QString();
+					unique->ownerAddress = QString();
+				}
 			}
 		}
 		_media = std::make_unique<Data::MediaGiftBox>(
